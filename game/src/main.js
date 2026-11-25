@@ -1,14 +1,17 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Boot and the one loop: input is read every frame, the kitchen advances in
+// fixed 1/60 s steps (several in a slow frame, none in a fast one), and the
+// renderer paints what is there. The game moves between four screens: title,
+// play, paused and shift over.
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// ?seed=N fixes the order stream. ?shot=cover|grill|serve|title (with &seed=N)
+// stages that scene instead of running the loop, paints it twice and sets
+// window.__shotReady for a screenshot.
+import { BEST_KEY, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
+import { createKitchen, EVENT_BURNT, EVENT_ERROR, EVENT_EXPIRE, EVENT_OVER, EVENT_PLATE, EVENT_READY, EVENT_RUSH, EVENT_SERVE } from './kitchen.js';
+import { ACTION_INTERACT, ACTION_MUTE, ACTION_PAUSE, ACTION_SERVE, createInput } from './input.js';
 import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createSounds } from './sounds.js';
 import { stageShot } from './shots.js';
 
 /** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
@@ -21,8 +24,18 @@ const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() 
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const kitchen = createKitchen(createRandom(seed));
 const renderer = createRenderer(canvas);
+const sounds = createSounds();
+
+/** Convert a pointer position on the page into logical room coordinates. */
+function toLogical(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scale = Math.min(rect.width / 1280, rect.height / 720);
+  const offsetX = (rect.width - 1280 * scale) / 2;
+  const offsetY = (rect.height - 720 * scale) / 2;
+  return { x: (clientX - rect.left - offsetX) / scale, y: (clientY - rect.top - offsetY) / scale };
+}
 
 function readBest() {
   try {
@@ -40,11 +53,30 @@ function saveBest(value) {
   }
 }
 
+function announce(message) {
+  status.textContent = message;
+}
+
+function playEvents(events) {
+  if (events & EVENT_SERVE) sounds.serve();
+  else if (events & EVENT_EXPIRE) sounds.expire();
+  else if (events & EVENT_BURNT) sounds.error();
+  else if (events & EVENT_READY) sounds.ding();
+  else if (events & EVENT_PLATE) sounds.pickup();
+  else if (events & EVENT_ERROR) sounds.error();
+  if (events & EVENT_RUSH) sounds.rush();
+}
+
 function runShot(name) {
-  const scene = stageShot(name, world);
+  const scene = stageShot(name, kitchen, createRandom(seed));
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    const nearest = kitchen.nearestStation();
+    renderer.draw(kitchen.state, scene.screen, scene.best, {
+      nearest,
+      binId: nearest === 'pantry' ? kitchen.pantryBin() : null,
+      muted: false,
+    });
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -53,53 +85,70 @@ function runShot(name) {
 }
 
 function runGame() {
-  const input = createInput(canvas);
+  const input = createInput(canvas, toLogical);
   let screen = SCREEN_TITLE;
   let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  let muted = false;
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
+  function startShift() {
+    kitchen.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    sounds.unlock();
+    announce('Playing. Cook what the order board asks for before the sun sets.');
   }
 
-  function endGame() {
+  function endShift() {
     screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
+    if (kitchen.state.coins > best) {
+      best = kitchen.state.coins;
       saveBest(best);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+    announce(`Shift over. ${kitchen.state.coins} coins earned. Best ${best}.`);
   }
 
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
+    if (actions & ACTION_MUTE) {
+      muted = sounds.toggleMute();
+      announce(muted ? 'Sound muted.' : 'Sound on.');
+    }
+    if (screen === SCREEN_TITLE || screen === SCREEN_OVER) {
+      if (actions & ACTION_INTERACT) startShift();
+      return;
+    }
+    if (actions & ACTION_PAUSE) {
+      if (screen === SCREEN_PLAY) {
+        screen = SCREEN_PAUSED;
+        announce('Paused.');
+      } else if (screen === SCREEN_PAUSED) {
+        screen = SCREEN_PLAY;
+        announce('Playing.');
+      }
+      return;
+    }
+    if (screen !== SCREEN_PLAY) return;
+    if (actions & (ACTION_INTERACT | ACTION_SERVE)) {
+      const events = kitchen.interact();
+      playEvents(events);
+      if (events & EVENT_OVER) endShift();
     }
   }
 
   function step() {
     if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+      kitchen.step(STEP, { x: 0, y: 0 }, true);
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    const move = input.direction(kitchen.state.chef.x, kitchen.state.chef.y);
+    const events = kitchen.step(STEP, move, false);
+    playEvents(events);
+    if (events & EVENT_EXPIRE) {
+      announce(`An order expired. ${kitchen.state.hearts} hearts left.`);
+    }
+    if (events & EVENT_OVER) endShift();
   }
 
   function frame(now) {
@@ -115,10 +164,15 @@ function runGame() {
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    const nearest = kitchen.nearestStation();
+    renderer.draw(kitchen.state, screen, best, {
+      nearest,
+      binId: nearest === 'pantry' ? kitchen.pantryBin() : null,
+      muted,
+    });
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
+  // Leaving the tab pauses a running game rather than letting orders expire unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -126,7 +180,7 @@ function runGame() {
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Sunset Skillet. Press Space or click to start cooking.');
   requestAnimationFrame(frame);
 }
 
